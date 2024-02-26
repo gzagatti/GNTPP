@@ -26,7 +26,21 @@ def SetSeed(seed):
     numpy.random.seed(seed)
 
 TIME_EMB = ['Trigo', 'Linear']
-PROB_DEC = ['CNF','Diffusion','GAN','ScoreMatch','VAE','LogNorm','Gompt','Gaussian','Weibull','FNN', 'THP', 'SAHP']
+PROB_DEC = [
+    'CNF', # temporal conditional continuous normalizing flow (TCCNF)
+    'Diffusion', # temporal conditional diffusion denoising (TCDDM)
+    'GAN', # temporal conditional GAN (TCGAN)
+    'ScoreMatch', # temporal conditional noise score network (TCNSN)
+    'VAE', # temporal conditional variational autoencoder probabilistic model (TCVAE)
+    'LogNorm',
+    'Gompt',
+    'Gaussian',
+    'Weibull',
+    'FNN',
+    'THP',
+    'SAHP',
+    'Determ',
+]
 
 # NOTE: The given THP and SAHP use different type-modeling methods (type-wise intensity modelling), while others model all the type in a single sequence.
 # So the final metric evaluation will be in a different protocol.
@@ -36,10 +50,10 @@ HIST_ENC = ['LSTM', 'Attention']
 parser = argparse.ArgumentParser(prog="Attentive Diffusion Temporal Point Process (training)",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 # Basic
-parser.add_argument('--log_dir', type=str, metavar='DIR', 
+parser.add_argument('--log_dir', type=str, metavar='DIR',
                     help='Directory where models and logs will be saved.', default='experiments/')
 parser.add_argument('--dataset_dir', type=str, metavar='DIR', default='./data/stackoverflow/',
-                    choices=['./data/mooc/', './data/retweet/', './data/stackoverflow/', './data/synthetic_n5_c0.2/', './data/yelp/'],
+                    choices=['./data/mooc/', './data/retweet/', './data/stackoverflow/', './data/synthetic_n5_c0.2/', './data/yelp/', './data/simulated/', './data/retweet/', './data/mimic/'],
                     help='Directory for dataset.')
 
 # Training
@@ -48,14 +62,14 @@ parser.add_argument('--max_epoch', type=int, metavar='NUM', default=100,
 parser.add_argument('--lr', type=int, metavar='RATE', default=1e-3,
                     help='The leanring rate for training.')
 parser.add_argument('--load_epoch', type=int, metavar='NUM', default=0,
-                    help='Load the saved epoch number for continously training.')  
+                    help='Load the saved epoch number for continously training.')
 
 parser.add_argument('--batch_size', type=int, metavar='SIZE', default=16,
-                    help='Batch size for training.')        
+                    help='Batch size for training.')
 parser.add_argument('--val_batch_size', type=int, metavar='SIZE', default=8,
                     help='Batch size for validation, which should be smaller than training batch size because some metric requires MCMC sampling.')
 parser.add_argument('--experiment_name', type=str, metavar='SIZE', default=None,
-                    help='The experiment name, where the file where logs and models are saved will be called.') 
+                    help='The experiment name, where the file where logs and models are saved will be called.')
 
 # Model
 parser.add_argument('--time_emb', type=str, metavar='NAME', default='Trigo', choices=TIME_EMB,
@@ -67,9 +81,9 @@ parser.add_argument('--prob_dec', type=str, metavar='NAME', default='Diffusion',
 parser.add_argument('--embed_size', type=int, metavar='SIZE', default=32,
                     help='Hidden dimension for the model.')
 parser.add_argument('--layer_num', type=int, metavar='NUM', default=1,
-                    help='Layer number for the model.')  
+                    help='Layer number for the model.')
 parser.add_argument('--attention_heads', type=int, metavar='SIZE', default=4,
-                    help='Attention heads for the attention history encoder, which should be set as a divisor of embed size.')          
+                    help='Attention heads for the attention history encoder, which should be set as a divisor of embed size.')
 
 ###
 parser.add_argument('--gpu', type=int, metavar='DEVICE', default=6,
@@ -79,7 +93,7 @@ parser.add_argument('--seed', type=int, metavar='SEED', default=42,
 
 ## diffusion
 parser.add_argument('--diff_steps', type=int, metavar='NUM', default=1000,
-                    help='Diffusion steps in conditional temporal diffusion decoder.')          
+                    help='Diffusion steps in conditional temporal diffusion decoder.')
 
 
 args = parser.parse_args()
@@ -99,7 +113,7 @@ if __name__ == '__main__':
     args['mean_log_dt'] = mean_log_dt
     args['std_log_dt'] = std_log_dt
     args['max_dt'] = max_dt
-    
+
     if args['experiment_name'] == None:
         args['experiment_name'] = '{}_{}_{}_{}'.format(args['hist_enc'],
                                                        args['prob_dec'],
@@ -111,7 +125,7 @@ if __name__ == '__main__':
     sv_param = os.path.join(path, 'model_param.json')
     with open(sv_param, 'w') as file_obj:
         json.dump(args, file_obj)
-    
+
 
     time_embedding, type_embedding, position_embedding = get_embedding(**args)
     hist_encoder = get_encoder(**args)

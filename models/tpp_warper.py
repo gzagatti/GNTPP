@@ -91,6 +91,7 @@ class TPPWarper(nn.Module):
         return seq_dts
 
     def _compute_similarity(self, seq_dts, seq_types):
+        # compute similarity for type and position embedding matrices together
         _, type_embedding, position_embedding = self.get_embedding(seq_dts, seq_types)
         embedding = torch.cat([type_embedding, position_embedding], dim=-1)
         embedding_norm = torch.divide(embedding, embedding.norm(dim=-1, keepdim=True) + 1e-8)
@@ -98,6 +99,7 @@ class TPPWarper(nn.Module):
         return similarity
     
     def get_similarity(self):
+        # shows the normalized embedding weights matrix for types
         em = self.type_emb.weight[:-1, :]
         em_unit = torch.divide(em, em.norm(dim=-1, keepdim=True))
         similarity = torch.mm(em_unit, em_unit.transpose(0,1)).clamp(max=1, min=-1)
@@ -188,5 +190,5 @@ class TPPWarper(nn.Module):
             batch.in_dts, batch.in_types, batch.lag_matrixes, batch.out_onehots
         if reforward == True:
             self.forward(seq_dts, seq_types, lag_matrixes, *args)
-        return self.log_loss.cumulative_risk_func(self.history_embedding, seq_dts, sample_num, self.max_dt, steps)
-        
+        return self.log_loss.cumulative_risk_func(self.history_embedding, batch.out_dts, sample_num, self.max_dt, steps)
+

@@ -33,6 +33,10 @@ def get_logger(log_dir, name, log_filename='info.log', level=logging.INFO):
     console_handler.setFormatter(console_formatter)
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    # Add google cloud log handler
     logger.info('Log directory: %s', log_dir)
     return logger
+
+def remove_file_handlers(logger):
+    for handler in logger.handlers:
+        if hasattr(handler, "baseFilename"):
+            logger.removeHandler(handler)

@@ -6,6 +6,9 @@ from pathlib import Path
 import os
 from tqdm import tqdm
 import numpy as np 
+from torch.distributions import Categorical
+from datasets import tpp_loader
+import torch.nn.functional as F
 
 class Trainer:
     def __init__(self,
@@ -222,15 +225,16 @@ class Trainer:
         epoch_top3_acc = report_metric['TOP3_ACC'] if 'TOP3_ACC' in report_metric else epoch_top3_acc
 
         if 'QQDEV' in metrics:
-            cumrisk_samples = torch.cat(report_metric['QQDEV']).sort().values
-            sample_num = cumrisk_samples.shape[0]
-            probs = torch.linspace(0,1, 101)[1:-1].to(cumrisk_samples)
-            estimate_quantiles = torch.le(cumrisk_samples[:,None], probs[None,:]).sum(dim=0)/sample_num
-            exp1_quantiles = probs.log()
-            epoch_qqdev = (estimate_quantiles - exp1_quantiles).abs().mean()
+            cumrisk_samples = torch.cat(report_metric["QQDEV"]).sort().values
+            probs = torch.linspace(0, 1, 101)[1:-1].to(cumrisk_samples)
+            estimate_quantiles = torch.quantile(cumrisk_samples, probs)
+            exp1_quantiles = -(1 - probs).log()
+            epoch_qqdev = (
+                (estimate_quantiles - exp1_quantiles).abs().mean().detach().item()
+            )
             if plot_qq is not None:
                 import matplotlib.pyplot as plt
-                plt.scatter(estimate_quantiles, exp1_quantiles)
+                plt.scatter(estimate_quantiles.cpu().numpy(), exp1_quantiles.cpu().numpy())
                 plt.savefig(plot_qq+'.png')
 
         event_num = torch.sum(self._seq_lengths['{}'.format(dataset)]).float()
@@ -357,3 +361,67 @@ class Trainer:
         
     def plot_similarity(self, file_name='type_similarity'):
         self._model.plot_similarity(file_name)
+
+    def generate(self, batch, start_ix, n_samples):
+        max_t = self._max_t
+        with torch.no_grad():
+            _batch = tpp_loader.Batch(
+                batch.in_dts.clone(),
+                batch.in_types.clone(),
+                batch.in_times.clone(),
+                batch.lag_matrixes.clone(),
+                batch.seq_lengths.clone(),
+                batch.out_dts.clone(),
+                batch.out_types.clone(),
+                batch.out_onehots.clone(),
+            )
+            B, _ = _batch.in_times.shape
+            _batch.in_dts[:, start_ix:] = 0.0
+            _batch.in_types[:, start_ix:] = self._model.event_type_num
+            _batch.in_times[:, start_ix:] = 0.0
+            _batch.lag_matrixes = _batch.in_times[:,:,None] - _batch.in_times[:,None,:]
+            _batch.lag_matrixes[_batch.lag_matrixes < 0] = 0.0
+            idxT = (_batch.in_types < self._model.event_type_num).sum(dim=-1) - 1
+            _batch.seq_lengths = idxT + 1
+            N = (idxT.max() + 1).item()
+            for i in range(n_samples):
+                self._model.evaluate(_batch)
+                self._model.compute_ce(_batch)
+                sample_dts, mask = self._model.sample(_batch, sample_num=1, max_t=max_t, reforward=False)
+                sample_dts[sample_dts >= self._max_dt] = self._max_dt
+                sample_dts = sample_dts.squeeze(-1)
+                if sample_dts.dim() == 3:
+                    sample_dts = sample_dts[torch.arange(B), 0, idxT]
+                else:
+                    # GAN produce a sample with one dimension less
+                    sample_dts = sample_dts[torch.arange(B), idxT]
+                logits = self._model.predict_event_type()
+                mark_dist = Categorical(logits=logits[torch.arange(B), idxT, :-1])
+                next_type = mark_dist.sample()
+                if N >= _batch.in_times.shape[1]:
+                    _batch.in_dts = F.pad(_batch.in_dts, (0, 1))
+                    _batch.in_types = F.pad(_batch.in_types, (0, 1))
+                    _batch.in_times = F.pad(_batch.in_times, (0, 1))
+                    _batch.out_dts = F.pad(_batch.out_dts, (0, 1))
+                    _batch.out_types = F.pad(_batch.out_types, (0, 1))
+                    _batch.out_onehots = F.pad(_batch.out_onehots, (0, 0, 0, 1))
+                idxT += 1
+                N += 1
+                _batch.in_dts[torch.arange(B), idxT] = sample_dts
+                _batch.in_types[torch.arange(B), idxT] = next_type
+                _batch.in_times[torch.arange(B), idxT] = _batch.in_times[torch.arange(B), idxT-1] + sample_dts
+                _batch.lag_matrixes = _batch.in_times[:,:,None] - _batch.in_times[:,None,:]
+                _batch.lag_matrixes[_batch.lag_matrixes < 0] = 0.0
+                _batch.seq_lengths = idxT + 1
+
+        y_out = []
+        k_out = []
+        for i in range(B):
+            y_out.append(
+                batch.in_times[i, (idxT[i] - n_samples + 1) : (idxT[i] + 1)].unsqueeze(0)
+            )
+            k_out.append(
+                batch.in_types[i, (idxT[i] - n_samples + 1) : (idxT[i] + 1)].unsqueeze(0)
+            )
+
+        return y_out, k_out

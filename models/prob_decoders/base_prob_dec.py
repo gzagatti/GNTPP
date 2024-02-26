@@ -56,24 +56,25 @@ class BaseProbDecoder(nn.Module):
         return seq_dts.clamp(min=0.0)
     
     def empirical_cumulative_risk_func(self, history_embedding, dt, sample_num=400, max_dt=5.0, steps=40, max_t=50):
-        event_type_num = history_embedding.shape[-2]
-        intervals = torch.linspace(0, max_dt, steps).to(dt)
-        intervals = torch.cat([intervals,torch.tensor([max_t]).to(dt)])
-        dt_expand = dt[...,None].expand(-1,-1,event_type_num).unsqueeze(dim=-1)
-        intervals_expand = intervals.reshape(torch.ones(len(dt_expand.shape) - 1).long().tolist() + [-1])
-        gt_mask = torch.gt(dt_expand, intervals_expand)
-        interval_idx = gt_mask.sum(dim=-1) - 1
-        target_interval = torch.stack([intervals[interval_idx], intervals[interval_idx + 1]], dim=-1)
+        # The original implementation computed the percentage of the samples
+        # that fall within the interval containing the true interval. This
+        # would amount to computing the area of the PDF over regular intervals
+        # in the original temporal dimension. However, the regularity of the
+        # intervals is not maintained in the compensated space. Therefore, this
+        # information does not allow us to compute the inverted density and by
+        # extension the quantiles.
+        # Alternatively, we can compute the expected number of samples that are
+        # equal or below to the true interval. This would amount to computing
+        # the expected CDF which would then allow us to compute the inverted
+        # density and by extension the quantiles.
         samples, mask = self.t_sample(history_embedding=history_embedding, sample_num=sample_num)
         try: 
             assert mask.prod().float() == 1
-            samples = samples[...,None].transpose(1,-1).squeeze(dim=1)
-            gt_mask_samples = torch.gt(samples, target_interval[...,[0]])
-            le_mask_samples = torch.le(samples, target_interval[...,[1]])
-            total_number_in_interval = (gt_mask_samples * le_mask_samples).sum(dim=-1)
-            expectation_number = total_number_in_interval/sample_num
-            return expectation_number
-
+            total_number_le = torch.le(samples, dt[:, None, :, None].expand(-1, sample_num, -1, -1)).sum(dim=1)
+            empirical_cdf = total_number_le / sample_num
+            inverted = torch.where(empirical_cdf > 0, -(1-empirical_cdf).log(), 0)
+            inverted = torch.where(empirical_cdf == 1, 1e2, inverted)
+            return inverted
         except:
             raise NotImplementedError('The version of mask with invalid sample is YET to be developed.')
         

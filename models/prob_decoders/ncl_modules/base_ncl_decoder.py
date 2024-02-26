@@ -25,6 +25,7 @@ class BaseNCLDecoer(BaseProbDecoder):
         return log_loss, mark_logits
     
     def t_sample(self, history_embedding, seq_onehots=None, sample_num=100, *args):
+        # cannot sample time
         return 0
 
     def cumulative_risk_func(self, history_embedding, seq_dts, steps, max_dt, *args):

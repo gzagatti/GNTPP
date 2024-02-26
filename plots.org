@@ -1,0 +1,526 @@
+* Paper plots
+
+  #+begin_src python
+  import os
+  import re
+  import pickle
+  import numpy as np
+
+  import matplotlib as mpl
+  import matplotlib.pyplot as plt
+
+  from pathlib import Path
+  from time import time_ns
+  from tqdm import tqdm
+
+  font = {'family': 'sans-serif', 'weight': 'normal', 'size': 8.5}
+  mpl.rc('font', **font)
+
+  %load_ext autoreload
+  %autoreload 1
+  %aimport tpp_train
+  %aimport datasets.tpp_loader
+  %aimport models.tpp_warper
+  %aimport models.prob_decoders
+  %aimport models.prob_decoders.base_prob_dec
+  %aimport models.prob_decoders.deterministic.regression
+  %aimport models.prob_decoders.ncl_modules.base_ncl_decoder
+  %aimport models.embeddings
+  %aimport models.hist_encoders
+  %aimport models.libs.logger
+  %aimport trainers.trainer
+  %aimport multittpp
+  %aimport multittpp.plot
+
+  from tpp_train import args as default_args
+  from tpp_train import SetSeed
+  from datasets.tpp_loader import *
+  from models.tpp_warper import TPPWarper
+  from models.prob_decoders import *
+  from models.embeddings import *
+  from models.hist_encoders import *
+  from models.libs.logger import remove_file_handlers
+  from trainers.trainer import Trainer
+
+  default_args["dataset_dir"] = ""
+  default_args["device"] = torch.device('cuda:1')
+
+  gntpp_models = {
+      'Determ': 'DETER',
+      'Gompt': 'RMTPP',
+      'LogNorm': 'LogNorm',
+      'Gaussian': 'ERTPP',
+      'Weibull': 'WeibMix',
+      'FNN': 'FNNInt',
+      'SAHP': 'SAHP',
+      'THP': 'THP',
+      'Diffusion': 'TCDDM',
+      'VAE': 'TCVAE',
+      'GAN': 'TCGAN',
+      'CNF': 'TCCNF',
+      'ScoreMatch': 'TCNSN',
+  }
+  datasets = {"yelp": "Yelp", "simulated": "Hawkes", "retweet": "Retweet", "stackoverflow": "SO", "mimic": "MIMIC", "mooc": "MOOC"}
+  #+end_src
+
+** Loading models
+
+   #+begin_src python
+   def load_from_checkpoint(ckp, default_args=default_args, preload_best=False):
+       hist_enc, prob_dec, dataset_dir, seed = ckp.split("_")
+       dataset_dir = f"./data/{dataset_dir}/"
+       seed = int(seed)
+       args = default_args.copy()
+       args.update({"hist_enc": hist_enc, "prob_dec": prob_dec, "dataset_dir": dataset_dir,
+           "seed": seed})
+
+       SetSeed(args["seed"])
+       data, event_type_num, seq_lengths, max_length, max_t, mean_log_dt, std_log_dt, max_dt \
+           = load_dataset(**args)
+
+       args["log_dir"] = "experiments"
+       args['event_type_num'] = int(event_type_num)
+       args['max_length'] = int(max_length)
+       args['max_t'] = max_t
+       args['mean_log_dt'] = mean_log_dt
+       args['std_log_dt'] = std_log_dt
+       args['max_dt'] = max_dt
+       args['experiment_name'] = '{}_{}_{}_{}'.format(args['hist_enc'],
+                                                       args['prob_dec'],
+                                                       args['dataset_dir'].split('/')[-2],
+                                                       args['seed'])
+       path = Path(args['log_dir'])/args['experiment_name']
+
+       time_embedding, type_embedding, position_embedding = get_embedding(**args)
+       hist_encoder = get_encoder(**args)
+       prob_decoder = get_decoder(**args)
+
+
+       model = TPPWarper(time_embedding=time_embedding,
+                       type_embedding=type_embedding,
+                       position_embedding=position_embedding,
+                       encoder=hist_encoder,
+                       decoder=prob_decoder,
+                       **args)
+
+       trainer = Trainer(
+           data=data,
+           model=model,
+           seq_length=seq_lengths,
+           **args
+       )
+       remove_file_handlers(trainer._logger)
+
+       if preload_best:
+           model_path = Path(trainer._log_dir) / "saved_model"
+           model_list = os.listdir(model_path)
+           epoch_list = []
+           for filename in model_list:
+               epoch_list.append(int(re.search(r'\d+', filename).group()))
+           epoch_list = np.sort(epoch_list)
+           args["load_epoch"] = epoch_list[-1]
+           trainer.load_model(args["load_epoch"])
+
+       return trainer
+
+   ckp = "Attention_Determ_simulated_42"
+   trainer = load_from_checkpoint(ckp)
+   #+end_src
+
+** Additional metrics
+
+   Some exploratory work on the metrics.
+
+   #+begin_src python
+   ckp = "Attention_GAN_simulated_42"
+   trainer = load_from_checkpoint(ckp)
+   # metrics = ["LOG_LOSS", "CE", "MAPE", "TOP1_ACC", "TOP3_ACC"]
+   metrics = ["QQDEV"]
+   trainer.final_test(n=1, metrics=metrics)
+   #+end_src
+
+** Intensity rate plots
+
+   Helper to compute intensity function
+
+   #+begin_src python
+   def intensity_func(trainer, batch, dt, t_max):
+       with torch.no_grad():
+           trainer._model.evaluate(batch)
+           trainer._model.compute_ce(batch)
+           history_embedding = trainer._model.history_embedding
+           mark_logits = trainer._model.log_loss.mark_logits
+           event_type_num = trainer._model.event_type_num
+           batch_size, seq_length, event_num, embed_size = history_embedding.shape
+           multi = False
+           if hasattr(trainer._model.log_loss, "get_inter_time_dist"):
+               intensity_func = lambda x: trainer._model.log_loss.get_inter_time_dist(history_embedding).log_intensity(x).exp()
+           elif hasattr(trainer._model.log_loss, "intensity_func"):
+               multi = True
+               temp_hid = trainer._model.log_loss.his_to_param(history_embedding)
+               intensity_func = lambda x: trainer._model.log_loss.intensity_func(x, temp_hid)
+           else:
+               raise Error
+
+
+           in_times = batch.in_times
+           dts = batch.in_dts
+
+           n_samples = int(t_max / dt)
+           yT = torch.linspace(0, t_max, n_samples, device=in_times.device)
+
+           intensity = torch.empty(
+               (batch_size, n_samples, event_type_num), dtype=in_times.dtype, device=in_times.device
+           )
+
+           for i, t in enumerate(yT):
+               _dts = dts.clone()
+               if i == 0:
+                   idx = 0
+                   _dts[:, idx] = 1e-6
+               else:
+                   idx = ((in_times < t)*(batch.in_types < event_type_num)).sum(dim=1) - 1
+                   _dts[idx > 0, idx[idx > 0]] = t - in_times[idx > 0, idx[idx > 0]]
+                   _dts[idx <= 0, 0] = 1e-6
+                   idx[idx <= 0] = 0
+               _dts_expand = _dts[:,:,None].expand(batch_size, seq_length, event_num)
+               _intensity = intensity_func(_dts_expand)
+               _intensity = _intensity[torch.arange(batch_size), idx]
+               if not multi:
+                   _mark_logits = mark_logits[torch.arange(batch_size), idx, :-1]
+                   _mark_logits = _mark_logits / _mark_logits.sum(dim=1).unsqueeze(-1)
+                   _intensity = _intensity * _mark_logits
+               intensity[:, i, :] = _intensity
+
+       return yT, intensity
+   #+end_src
+
+   Define the parameters of the simulated data.
+
+   #+begin_src python
+   import torch.nn.functional as F
+
+   adj = torch.ones((2,2), device=default_args["device"])
+   baselines = torch.tensor([ 0.1, 0.2], device=default_args["device"])
+   kernels = [
+       [
+           lambda t: 0.2*(0.5 + t)**(-1.3),
+           lambda t: 0.03*torch.exp(-0.3*t),
+       ],
+       [
+           lambda t: 0.05*torch.exp(-0.2*t) + 0.16*torch.exp(-0.8*t),
+           lambda t: torch.where((t >= 0) & (t <= 4), F.relu(torch.sin(t) / 8), 0.),
+       ]
+   ]
+
+   dt = 0.2
+   t_max = 50
+   n_marks = 2
+   #+end_src
+
+   Draw the Intensity for the simulated data.
+
+   #+begin_src python
+   for model, model_title in gntpp_models.items():
+       ckp = f"Attention_{model}_simulated_42"
+       trainer._logger.handlers.clear()
+       trainer = load_from_checkpoint(ckp, preload_best=True)
+
+       scale = trainer.data["test_loader"].dataset.max_t_normalization / trainer.data["test_loader"].dataset.scale_normalization
+
+       with torch.no_grad():
+           for batch in trainer.data['test_loader']:
+               y = batch.in_times
+               k = batch.in_types
+               try:
+                   yT_pred, intensity_pred = intensity_func(trainer, batch, dt=dt, t_max=t_max)
+               except:
+                   yT_pred, intensity_pred = None, None
+               break
+
+       if yT_pred is None:
+           continue
+
+       yT, intensity = multittpp.hawkes_intensity(y*scale, k, n_marks, dt, t_max*scale, adj, baselines, kernels)
+
+       # THP is the last to be plotted
+       if model_title == "THP":
+           fig, ax = plt.subplots(1, 1, sharex=True, sharey=True, figsize=(7, 1.5))
+       else:
+           fig, ax = plt.subplots(1, 1, sharex=True, sharey=True, figsize=(7, 1.2))
+       fig = multittpp.plot.plot_intensity(
+           6,
+           intensity_pred/scale,
+           yT_pred*scale,
+           kix=0,
+           intensity=intensity,
+           yT=yT,
+           y=y*scale,
+           k=k,
+           y_label_extra=model_title,
+           title=None,
+           ax=ax,
+           show=False,
+       )
+       fig.tight_layout()
+       ax.get_yaxis().set_major_formatter(
+           mpl.ticker.FuncFormatter(mpl.ticker.StrMethodFormatter('{x:,.1f}'))
+       )
+       if model_title != "THP":
+           ax.get_xaxis().set_visible(False)
+       fig.tight_layout()
+       plt.show()
+       # fig.savefig(f"./figs/{model_title}-hawkes-predicted-intensity.pdf")
+       fig.savefig(f"./figs/{model_title}-hawkes-predicted-intensity.svg")
+   #+end_src
+
+   Draw the intensity for the retweet dataset.
+
+   #+begin_src python
+   t_max = 70_000
+   dt = 70
+   for (model, model_title) in gntpp_models.items():
+       ckp = f"Attention_{model}_retweet_42"
+       trainer._logger.handlers.clear()
+       trainer = load_from_checkpoint(ckp, preload_best=True)
+
+       scale = trainer.data["test_loader"].dataset.max_t_normalization / trainer.data["test_loader"].dataset.scale_normalization
+       scaled_t_max = t_max / scale
+       scaled_dt = dt / scale
+
+       with torch.no_grad():
+           for batch in trainer.data['test_loader']:
+               y = batch.in_times
+               k = batch.in_types
+               try:
+                   yT_pred, intensity_pred = intensity_func(trainer, batch, dt=scaled_dt, t_max=scaled_t_max)
+               except:
+                   yT_pred, intensity_pred = None, None
+               break
+
+       if yT_pred is None:
+           continue
+
+       # THP is the last to be plotted
+       if model_title == "THP":
+           fig, ax = plt.subplots(1, 1, sharex=True, sharey=True, figsize=(7, 1.5))
+       else:
+           fig, ax = plt.subplots(1, 1, sharex=True, sharey=True, figsize=(7, 1.2))
+       fig = multittpp.plot.plot_intensity(
+           0,
+           intensity_pred/scale,
+           yT_pred*scale,
+           y=y*scale,
+           k=k,
+           kix=1,
+           t_max=t_max,
+           ax=ax,
+           y_label_extra=model_title,
+           title=None,
+           show=False,
+       )
+       fig.tight_layout()
+       ax.get_yaxis().set_major_formatter(
+           mpl.ticker.FuncFormatter(mpl.ticker.StrMethodFormatter('{x:,.4f}'))
+       )
+       ax.get_xaxis().set_major_formatter(
+           mpl.ticker.FuncFormatter(mpl.ticker.StrMethodFormatter('{x:,.0f}'))
+       )
+       if model_title != "THP":
+           ax.get_xaxis().set_visible(False)
+       ax.get_legend().remove()
+       fig.tight_layout()
+       plt.show()
+       # fig.savefig(f"./figs/{model_title}-retweet-predicted-intensity.pdf")
+       fig.savefig(f"./figs/{model_title}-retweet-predicted-intensity.svg")
+   #+end_src
+
+** QQ-Plot
+
+   Helper to produce quantiles.
+
+   #+begin_src python
+   def empirical_quantiles(trainer, n_threshold, steps=40):
+       x = [[] for _ in range(trainer._model.event_type_num)]
+       flat_x = []
+       with torch.no_grad():
+           for batch in trainer.data['test_loader']:
+               trainer._model.evaluate(batch)
+               _x = trainer._model.cumulative_risk_func(batch, sample_num=400, steps=steps)
+               _x = _x.expand_as(batch.out_onehots)[batch.out_onehots.bool()]
+               _types = batch.out_types[batch.out_types < trainer._model.event_type_num]
+               flat_x.append(_x)
+               for mark in range(trainer._model.event_type_num):
+                   x[mark].append(_x[mark == _types])
+
+       probs = torch.linspace(0, 1, 101)[1:-1].to(batch.in_times.device)
+
+       flat_quant_pred = torch.quantile(torch.cat(flat_x), probs)
+       quant_pred = [[] for _ in range(trainer._model.event_type_num)]
+
+       for mark in range(trainer._model.event_type_num):
+           x[mark] = torch.cat(x[mark])
+           if (len(x[mark]) != 0) and (x[mark].shape[0] > n_threshold):
+               x[mark] = x[mark].sort().values
+               quant_pred[mark] = torch.quantile(x[mark], probs)
+           else:
+               quant_pred[mark] = torch.tensor([], dtype=x[mark].dtype)
+
+       return probs, quant_pred, flat_quant_pred
+   #+end_src
+
+   First we produce a QQ-plot for a single dataset.
+
+   #+begin_src python
+   ckp = "Attention_SAHP_simulated_42"
+   trainer._logger.handlers.clear()
+   trainer = load_from_checkpoint(ckp, preload_best=True)
+   probs, quant_pred, flat_quant_pred = empirical_quantiles(trainer, n_threshold=50)
+   multittpp.plot.plot_qq(quant_pred, probs, prob_axis=True)
+   multittpp.plot.plot_qq([flat_quant_pred], probs, prob_axis=True)
+   #+end_src
+
+   We pre-compute the quantile values.
+
+   #+begin_src python
+   quantiles_path = Path("./experiments/quantiles.pkl")
+   if quantiles_path.exists():
+       with open(quantiles_path, "rb") as f:
+           probs = pickle.load(f)
+           quant_preds = pickle.load(f)
+           flat_quant_preds = pickle.load(f)
+   else:
+       quant_preds = {}
+       flat_quant_preds = {}
+   for model in gntpp_models:
+       if model not in quant_preds:
+           quant_preds[model] = {}
+           flat_quant_preds[model] = {}
+       for dataset in datasets:
+           if dataset in quant_preds[model]:
+               continue
+           ckp = f"Attention_{model}_{dataset}_42"
+           trainer._logger.handlers.clear()
+           trainer = load_from_checkpoint(ckp, preload_best=True)
+           probs, quant_pred, flat_quant_pred = empirical_quantiles(trainer, n_threshold=50)
+           quant_preds[model][dataset] = quant_pred
+           flat_quant_preds[model][dataset] = [flat_quant_pred]
+   # with open(quantiles_path, "wb") as f:
+   #     pickle.dump(probs, f)
+   #     pickle.dump(quant_preds, f)
+   #     pickle.dump(flat_quant_preds, f)
+   #+end_src
+
+   We plot the quantiles of the flattened data which features in the paper.
+
+   #+begin_src python
+   target_models = ["SAHP", "Diffusion"]
+   for row, model in enumerate(target_models):
+       _flat_quant_preds = flat_quant_preds[model]
+       cols = 6
+       if row == len(target_models) - 1:
+           figsize = (7, 1.37)
+       else:
+           figsize = (7, 1)
+       fig, ax = plt.subplots(1, cols, sharex=True, sharey=True, figsize=figsize)
+       for i, dataset in enumerate(datasets):
+           axi = ax[i]
+           multittpp.plot.plot_qq(_flat_quant_preds[dataset], probs, title=None, y_label_extra=gntpp_models[model], show=False, ax=axi, rasterized=True)
+           if row != len(target_models) - 1:
+               axi.get_xaxis().set_visible(False)
+           if (i%cols) > 0:
+               axi.get_yaxis().set_visible(False)
+       fig.tight_layout()
+       plt.show()
+       fig.savefig(f"./figs/{gntpp_models[model]}-all-qqplots.pdf")
+       fig.savefig(f"./figs/{gntpp_models[model]}-all-qqplots.svg", dpi=350)
+   #+end_src
+
+   We plot the quantiles of the marked data which features in the Supplementary Materials.
+
+   #+begin_src python
+   for i, model in enumerate(gntpp_models):
+       cols = 6
+       if model in ["FNN"]:
+           fig, ax = plt.subplots(1, cols, sharex=True, sharey=True, figsize=(7, 1.2))
+       elif model in ["Weibull", "ScoreMatch"]:
+           fig, ax = plt.subplots(1, cols, sharex=True, sharey=True, figsize=(7, 1.37))
+       else:
+           fig, ax = plt.subplots(1, cols, sharex=True, sharey=True, figsize=(7, 1))
+       for j, (dataset, dataset_title) in enumerate(datasets.items()):
+           axj = ax[j]
+           if model not in ["FNN"]:
+               dataset_title = None
+           multittpp.plot.plot_qq(quant_preds[model][dataset], probs, title=dataset_title, show=False, ax=axj, y_label_extra=gntpp_models[model], rasterized=True)
+           if model not in ["Weibull", "ScoreMatch"]:
+               axj.get_xaxis().set_visible(False)
+           if (j%cols) > 0:
+               axj.get_yaxis().set_visible(False)
+       fig.tight_layout()
+       plt.show()
+       fig.savefig(f"./figs/{gntpp_models[model]}-marked-qqplots.pdf")
+       fig.savefig(f"./figs/{gntpp_models[model]}-marked-qqplots.svg", dpi=350)
+   #+end_src
+
+** Event generation benchmark
+
+   Helper to run generation benchmarks.
+
+   #+begin_src python
+   def benchmark(trainer, n_iter):
+       n_samples = [25, 50, 100, 200, 400, 800, 1600]
+       times = [[] for _ in n_samples]
+
+       # adjust positional embedding table to accomodate generation
+       max_length = n_samples[-1] + 1
+       with torch.no_grad():
+           posemb = trainer._model.position_emb
+           embed_size = posemb.embedding.shape[1] // 2
+           device = posemb.embedding.device
+           posemb.embedding = posemb._build_embedding(embed_size, max_length).to(device)
+
+       with torch.no_grad():
+           for i, batch in enumerate(trainer.data['test_loader']):
+               if i == n_iter:
+                   break
+
+               for j, n in enumerate(tqdm(n_samples, leave=False)):
+                   start = time_ns()
+                   y_gen, k_gen = trainer.generate(
+                       batch, start_ix=1, n_samples=n
+                   )
+                   elapsed = time_ns() - start
+                   times[j].append(elapsed)
+
+       return {"times": times, "n_samples": n_samples}
+   #+end_src
+
+   We compute the benchmarks and save.
+
+   #+begin_src python
+   benchmarks_path = Path("./experiments/benchmarks.pkl")
+   if benchmarks_path.exists():
+       with open(benchmarks_path, "rb") as f:
+           benchs = pickle.load(f)
+   else:
+       benchs = {}
+   for model in gntpp_models:
+       # some models do not implement sample
+       # SAHP, THP, FNN do not implement
+       # Determ, Gaussian, Gompt can return negative time
+       if model in ["SAHP", "THP", "FNN", "Determ", "Gompt", "Gaussian"]:
+           continue
+       if model not in benchs:
+           benchs[model] = {}
+       for dataset in datasets:
+           if dataset in benchs[model]:
+               continue
+           ckp = f"Attention_{model}_{dataset}_42"
+           trainer._logger.handlers.clear()
+           trainer = load_from_checkpoint(ckp, preload_best = True)
+           print(f"Sampling {ckp}.")
+           times = benchmark(trainer, n_iter=1)
+           benchs[model][dataset] = times
+           # with open(benchmarks_path, "wb") as f:
+           #     pickle.dump(benchs, f)
+   #+end_src

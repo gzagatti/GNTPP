@@ -22,6 +22,7 @@ class RegHead(BaseProbDecoder):
     def forward(self, seq_dts, seq_types, seq_onehots, history_embedding, *args):
         log_loss = self.compute_loss(seq_dts, seq_onehots, history_embedding)
         mark_logits = self.compute_ce(history_embedding, seq_types)
+        self.mark_logits = mark_logits
         return log_loss, mark_logits
     
     def predict(self, history_embedding):
@@ -49,3 +50,6 @@ class RegHead(BaseProbDecoder):
     def inter_time_dist_pred(self, history_embedding, max_t, resolution):
         interval = self.predict(history_embedding)
         return interval
+
+    def cumulative_risk_func(self, history_embedding, dt, sample_num=200, max_dt=5, steps=20):
+        return self.empirical_cumulative_risk_func(history_embedding, dt, sample_num=sample_num, max_dt=max_dt, steps=steps)
